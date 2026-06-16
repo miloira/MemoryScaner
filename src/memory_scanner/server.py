@@ -17,10 +17,7 @@ import psutil
 from mcp.server.fastmcp import FastMCP
 
 # 创建 MCP 服务器实例
-mcp = FastMCP(
-    "MemoryScanner",
-    description="基于 pymem 的内存扫描与修改工具，支持进程内存读写、扫描、模式搜索等功能",
-)
+mcp = FastMCP("MemoryScanner")
 
 
 # 全局状态管理

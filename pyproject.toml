@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memory-scanner-mcp"
-version = "0.0.1"
+version = "0.0.2"
 description = "基于 pymem 的内存扫描与修改 MCP 服务器，支持进程内存读写、扫描、模式搜索等功能"
 readme = "README.md"
 license = "MIT"
