@@ -1333,58 +1333,25 @@ def invalidate_window(process_name: str = "", process_id: int = 0) -> str:
 @mcp.tool()
 def encode_string(
     text: str,
-    encoding: str = "utf-8",
-    null_terminate: bool = True,
+    encoding: str = "utf-16le",
 ) -> str:
     """字符串编码器 - 将文本编码为十六进制字符串
 
     用于将字符串转换为可直接用于内存写入的十六进制格式。
+    支持 Python 所有内置编码。
 
     Args:
         text: 要编码的文本字符串
-        encoding: 编码格式 (utf-8/utf-16le/utf-16be/ascii/gbk/gb2312/latin1)
-        null_terminate: 是否在末尾添加 null 终止符（默认 True）
+        encoding: 编码格式，支持 Python 所有内置编码（默认 utf-16le）
 
     Returns:
-        十六进制字符串及相关信息
+        十六进制字符串
     """
-    supported_encodings = [
-        "utf-8", "utf-16le", "utf-16be", "ascii",
-        "gbk", "gb2312", "latin1", "utf-32le", "utf-32be",
-    ]
-
-    if encoding.lower().replace("-", "") not in [
-        e.replace("-", "") for e in supported_encodings
-    ]:
-        return (
-            f"错误: 不支持的编码 '{encoding}'\n"
-            f"支持的编码: {', '.join(supported_encodings)}"
-        )
-
     try:
         encoded = text.encode(encoding)
-    except (UnicodeEncodeError, LookupError) as e:
-        return f"错误: 编码失败 - {e}"
+    except LookupError:
+        return f"错误: 未知编码 '{encoding}'，请使用 Python 支持的编码名称"
+    except UnicodeEncodeError as e:
+        return f"错误: 文本无法用 {encoding} 编码 - {e}"
 
-    if null_terminate:
-        # 根据编码添加对应宽度的 null 终止符
-        if encoding.lower() in ("utf-16le", "utf-16be"):
-            encoded += b"\x00\x00"
-        elif encoding.lower() in ("utf-32le", "utf-32be"):
-            encoded += b"\x00\x00\x00\x00"
-        else:
-            encoded += b"\x00"
-
-    hex_str = encoded.hex().upper()
-    hex_spaced = " ".join(f"{encoded[i]:02X}" for i in range(len(encoded)))
-
-    return (
-        f"编码结果:\n"
-        f"  原文: \"{text}\"\n"
-        f"  编码: {encoding}\n"
-        f"  字符数: {len(text)}\n"
-        f"  字节数: {len(encoded)}\n"
-        f"  Null终止: {'是' if null_terminate else '否'}\n\n"
-        f"  十六进制 (连续): {hex_str}\n"
-        f"  十六进制 (空格): {hex_spaced}"
-    )
+    return encoded.hex().upper()
