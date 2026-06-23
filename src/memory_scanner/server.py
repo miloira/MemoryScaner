@@ -1093,6 +1093,63 @@ def dump_memory(address: str, size: int = 256, columns: int = 16) -> str:
 
 
 @mcp.tool()
+def batch_dump_memory(
+    addresses: str,
+    size: int = 64,
+    columns: int = 16,
+) -> str:
+    """批量内存转储 - 同时转储多个地址的内存内容
+
+    Args:
+        addresses: 多个内存地址，逗号分隔（支持十六进制如 "0x12345678,0x12345780"）
+        size: 每个地址转储的字节数（默认64，最大1024）
+        columns: 每行显示的字节数（默认16）
+
+    Returns:
+        所有地址的格式化内存转储
+    """
+    if not state.pm:
+        return "错误: 未附加任何进程，请先使用 attach_process"
+
+    addr_list = []
+    for addr_str in addresses.split(","):
+        addr_str = addr_str.strip()
+        if not addr_str:
+            continue
+        try:
+            addr_list.append(
+                int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+            )
+        except ValueError:
+            return f"错误: 无效的地址格式 '{addr_str}'"
+
+    if not addr_list:
+        return "错误: 未提供有效地址"
+
+    size = min(size, 1024)
+    sections = []
+
+    for addr in addr_list:
+        section_lines = [f"━━━ 0x{addr:X} ({size} bytes) ━━━"]
+        try:
+            data = state.pm.read_bytes(addr, size)
+            for i in range(0, len(data), columns):
+                chunk = data[i : i + columns]
+                hex_part = " ".join(f"{b:02X}" for b in chunk)
+                ascii_part = "".join(
+                    chr(b) if 32 <= b < 127 else "." for b in chunk
+                )
+                section_lines.append(
+                    f"0x{addr + i:08X}  {hex_part:<{columns * 3}}  {ascii_part}"
+                )
+        except Exception as e:
+            section_lines.append(f"  <读取失败: {e}>")
+        sections.append("\n".join(section_lines))
+
+    return "\n\n".join(sections)
+
+
+@mcp.tool()
 def get_scan_results(start: int = 0, count: int = 20) -> str:
     """获取当前扫描结果列表
 
@@ -1355,3 +1412,34 @@ def encode_string(
         return f"错误: 文本无法用 {encoding} 编码 - {e}"
 
     return encoded.hex().upper()
+
+
+@mcp.tool()
+def calc_address(expression: str) -> str:
+    """地址计算器 - 计算地址表达式
+
+    支持十六进制和十进制的加减乘运算，避免手动计算错误。
+
+    Args:
+        expression: 地址计算表达式，支持 +, -, *, 括号, 十六进制(0x前缀)
+                    例如: "0x7FF6C76D0000 + 0x1A4", "0x12345678 - 0x100", "0x1000 * 4"
+
+    Returns:
+        计算结果（十六进制和十进制）
+    """
+    expr = expression.strip()
+    if not expr:
+        return "错误: 表达式为空"
+
+    # 将 0x 十六进制数转换为 Python 可 eval 的格式（0x 已原生支持）
+    # 安全检查：只允许数字、十六进制字符、运算符和括号
+    allowed = set("0123456789abcdefABCDEFxX+-*()/ \t")
+    if not all(c in allowed for c in expr):
+        return f"错误: 表达式包含不允许的字符，仅支持: 数字, 0x十六进制, +, -, *, /, ()"
+
+    try:
+        result = int(eval(expr))  # noqa: S307
+    except Exception as e:
+        return f"错误: 计算失败 - {e}"
+
+    return f"0x{result:X} ({result})"
