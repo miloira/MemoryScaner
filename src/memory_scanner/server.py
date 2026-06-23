@@ -334,6 +334,157 @@ def write_memory(address: str, value: str, value_type: str = "int32") -> str:
 
 
 @mcp.tool()
+def batch_read_memory(
+    addresses: str,
+    value_type: str = "int32",
+    length: int = 0,
+) -> str:
+    """批量读取多个地址的内存值
+
+    Args:
+        addresses: 多个内存地址，逗号分隔（支持十六进制如 "0x12345678,0x12345680,0x12345688"）
+        value_type: 值类型 (int8/int16/int32/int64/uint8/uint16/uint32/uint64/float/double/string/bytes)
+        length: 当类型为 string 或 bytes 时，读取的字节数（默认 string=256, bytes=64）
+
+    Returns:
+        每个地址的读取结果
+    """
+    if not state.pm:
+        return "错误: 未附加任何进程，请先使用 attach_process"
+
+    addr_list = []
+    for addr_str in addresses.split(","):
+        addr_str = addr_str.strip()
+        if not addr_str:
+            continue
+        try:
+            addr_list.append(
+                int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+            )
+        except ValueError:
+            return f"错误: 无效的地址格式 '{addr_str}'"
+
+    if not addr_list:
+        return "错误: 未提供有效地址"
+
+    lines = [f"批量读取 ({value_type}), 共 {len(addr_list)} 个地址:\n"]
+    success = 0
+    failed = 0
+
+    for addr in addr_list:
+        try:
+            if value_type == "string":
+                read_len = length if length > 0 else 256
+                data = state.pm.read_bytes(addr, read_len)
+                val = data.split(b"\x00")[0].decode("utf-8", errors="replace")
+                lines.append(f"  0x{addr:X} = \"{val}\"")
+            elif value_type == "bytes":
+                read_len = length if length > 0 else 64
+                data = state.pm.read_bytes(addr, read_len)
+                hex_str = " ".join(f"{b:02X}" for b in data[:32])
+                if read_len > 32:
+                    hex_str += " ..."
+                lines.append(f"  0x{addr:X} = {hex_str}")
+            else:
+                fmt, size = TYPE_FORMAT[value_type]
+                data = state.pm.read_bytes(addr, size)
+                val = struct.unpack(fmt, data)[0]
+                if isinstance(val, float):
+                    lines.append(f"  0x{addr:X} = {val:.6f}")
+                else:
+                    lines.append(f"  0x{addr:X} = {val}")
+            success += 1
+        except Exception as e:
+            lines.append(f"  0x{addr:X} = <读取失败: {e}>")
+            failed += 1
+
+    lines.append(f"\n成功: {success}, 失败: {failed}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def batch_write_memory(
+    addresses: str,
+    values: str,
+    value_type: str = "int32",
+) -> str:
+    """批量写入多个地址的内存值
+
+    Args:
+        addresses: 多个内存地址，逗号分隔（支持十六进制如 "0x12345678,0x12345680"）
+        values: 对应的写入值，逗号分隔。若只提供一个值，则所有地址写入相同值
+        value_type: 值类型 (int8/int16/int32/int64/uint8/uint16/uint32/uint64/float/double/string/bytes)
+
+    Returns:
+        每个地址的写入结果
+    """
+    if not state.pm:
+        return "错误: 未附加任何进程，请先使用 attach_process"
+
+    # 解析地址列表
+    addr_list = []
+    for addr_str in addresses.split(","):
+        addr_str = addr_str.strip()
+        if not addr_str:
+            continue
+        try:
+            addr_list.append(
+                int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+            )
+        except ValueError:
+            return f"错误: 无效的地址格式 '{addr_str}'"
+
+    if not addr_list:
+        return "错误: 未提供有效地址"
+
+    # 解析值列表
+    value_list = [v.strip() for v in values.split(",") if v.strip()]
+    if not value_list:
+        return "错误: 未提供有效值"
+
+    # 如果只有一个值，扩展到和地址数量一样
+    if len(value_list) == 1:
+        value_list = value_list * len(addr_list)
+    elif len(value_list) != len(addr_list):
+        return (
+            f"错误: 地址数量 ({len(addr_list)}) 与值数量 ({len(value_list)}) 不匹配\n"
+            f"提示: 提供与地址相同数量的值，或仅提供一个值（将写入所有地址）"
+        )
+
+    lines = [f"批量写入 ({value_type}), 共 {len(addr_list)} 个地址:\n"]
+    success = 0
+    failed = 0
+
+    for addr, val in zip(addr_list, value_list):
+        try:
+            if value_type == "string":
+                data = val.encode("utf-8") + b"\x00"
+            elif value_type == "bytes":
+                data = bytes.fromhex(val.replace(" ", ""))
+            elif value_type in ("float", "double"):
+                data = _encode_value(value_type, float(val))
+            else:
+                data = _encode_value(value_type, int(val))
+
+            state.pm.write_bytes(addr, data, len(data))
+
+            # 回读验证
+            verify = state.pm.read_bytes(addr, len(data))
+            if verify == data:
+                lines.append(f"  0x{addr:X} <- {val} ✓")
+                success += 1
+            else:
+                lines.append(f"  0x{addr:X} <- {val} (验证不一致)")
+                failed += 1
+        except Exception as e:
+            lines.append(f"  0x{addr:X} <- {val} ✗ ({e})")
+            failed += 1
+
+    lines.append(f"\n成功: {success}, 失败: {failed}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def scan_memory_first(
     value: str,
     value_type: str = "int32",
@@ -1084,3 +1235,87 @@ def list_frozen() -> str:
             lines.append(f"  0x{addr:X} = {data.hex()} ({vtype})")
 
     return "\n".join(lines)
+
+
+@mcp.tool()
+def invalidate_window(process_name: str = "", process_id: int = 0) -> str:
+    """触发目标进程窗口重绘（InvalidateRect）
+
+    通过向目标进程的所有顶层窗口发送重绘请求，强制刷新显示内容。
+    修改内存后调用此工具可立即看到效果。
+
+    Args:
+        process_name: 进程名（可选，默认使用当前附加的进程）
+        process_id: 进程PID（可选，默认使用当前附加的进程）
+
+    Returns:
+        重绘结果
+    """
+    # 确定目标 PID
+    target_pid = 0
+    if process_id:
+        target_pid = process_id
+    elif process_name:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if proc.info["name"].lower() == process_name.lower():
+                    target_pid = proc.info["pid"]
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if not target_pid:
+            return f"错误: 未找到进程 '{process_name}'"
+    elif state.process_id:
+        target_pid = state.process_id
+    else:
+        return "错误: 未指定目标进程，也未附加任何进程"
+
+    # Windows API 定义
+    user32 = ctypes.windll.user32
+
+    # EnumWindows 回调类型
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        ctypes.wintypes.BOOL,
+        ctypes.wintypes.HWND,
+        ctypes.wintypes.LPARAM,
+    )
+
+    # 收集目标进程的窗口句柄
+    hwnd_list = []
+
+    def enum_callback(hwnd, lparam):
+        pid = ctypes.wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == target_pid:
+            if user32.IsWindowVisible(hwnd):
+                hwnd_list.append(hwnd)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+
+    if not hwnd_list:
+        return f"未找到进程 PID={target_pid} 的可见窗口"
+
+    # 对每个窗口调用 InvalidateRect + UpdateWindow
+    RDW_INVALIDATE = 0x0001
+    RDW_UPDATENOW = 0x0100
+    RDW_ALLCHILDREN = 0x0080
+
+    success = 0
+    for hwnd in hwnd_list:
+        # RedrawWindow 比 InvalidateRect 更强力
+        result = user32.RedrawWindow(
+            hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+        )
+        if result:
+            success += 1
+
+    return (
+        f"窗口重绘完成:\n"
+        f"  目标进程 PID: {target_pid}\n"
+        f"  找到窗口数: {len(hwnd_list)}\n"
+        f"  成功重绘: {success}"
+    )
