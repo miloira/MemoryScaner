@@ -1333,7 +1333,7 @@ def invalidate_window(process_name: str = "", process_id: int = 0) -> str:
 @mcp.tool()
 def encode_string(
     text: str,
-    encoding: str = "utf-16le",
+    encoding: str = "utf-8",
 ) -> str:
     """字符串编码器 - 将文本编码为十六进制字符串
 
