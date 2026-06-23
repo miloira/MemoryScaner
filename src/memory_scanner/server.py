@@ -4,6 +4,7 @@ Memory Scanner MCP Server
 支持进程附加、内存扫描、值修改、地址监控等功能
 """
 
+import re
 import struct
 import ctypes
 import ctypes.wintypes
@@ -50,6 +51,48 @@ READABLE_PROTECTIONS = (
     PAGE_EXECUTE_READ,
     PAGE_EXECUTE_READWRITE,
 )
+
+
+# 模块级 MEMORY_BASIC_INFORMATION 定义（避免重复创建）
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", ctypes.wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", ctypes.wintypes.DWORD),
+        ("Protect", ctypes.wintypes.DWORD),
+        ("Type", ctypes.wintypes.DWORD),
+    ]
+
+
+MBI_SIZE = ctypes.sizeof(MEMORY_BASIC_INFORMATION())
+
+
+def _iter_readable_regions(handle, start=0x10000, end=0x7FFFFFFFFFFF):
+    """迭代进程中所有可读的已提交内存区域
+
+    Yields:
+        (base_address, region_size) tuples
+    """
+    mbi = MEMORY_BASIC_INFORMATION()
+    address = start
+
+    while address < end:
+        result = ctypes.windll.kernel32.VirtualQueryEx(
+            handle,
+            ctypes.c_void_p(address),
+            ctypes.byref(mbi),
+            MBI_SIZE,
+        )
+        if result == 0:
+            break
+
+        region_size = mbi.RegionSize
+        if mbi.State == MEM_COMMIT and mbi.Protect in READABLE_PROTECTIONS:
+            yield (address, region_size)
+
+        address += region_size
 
 
 class ValueType(str, Enum):
@@ -531,55 +574,41 @@ def scan_memory_first(
     state.scan_type = value_type
     state.scan_results = []
 
-    # 遍历内存区域
+    # 确定对齐（数值类型按自然对齐搜索，string/bytes 逐字节）
+    alignment = 1
+    if value_type in TYPE_FORMAT:
+        alignment = TYPE_FORMAT[value_type][1]  # 自然对齐: int32->4, int16->2, etc.
+
     handle = state.pm.process_handle
-    address = start
-
-    class MEMORY_BASIC_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("BaseAddress", ctypes.c_void_p),
-            ("AllocationBase", ctypes.c_void_p),
-            ("AllocationProtect", ctypes.wintypes.DWORD),
-            ("RegionSize", ctypes.c_size_t),
-            ("State", ctypes.wintypes.DWORD),
-            ("Protect", ctypes.wintypes.DWORD),
-            ("Type", ctypes.wintypes.DWORD),
-        ]
-
-    mbi = MEMORY_BASIC_INFORMATION()
-    mbi_size = ctypes.sizeof(mbi)
-
     max_results = 10000
 
-    while address < end and len(state.scan_results) < max_results:
-        result = ctypes.windll.kernel32.VirtualQueryEx(
-            handle,
-            ctypes.c_void_p(address),
-            ctypes.byref(mbi),
-            mbi_size,
-        )
-
-        if result == 0:
+    for region_base, region_size in _iter_readable_regions(handle, start, end):
+        if len(state.scan_results) >= max_results:
             break
-
-        region_size = mbi.RegionSize
-
-        if mbi.State == MEM_COMMIT and mbi.Protect in READABLE_PROTECTIONS:
-            try:
-                data = state.pm.read_bytes(address, region_size)
+        try:
+            data = state.pm.read_bytes(region_base, region_size)
+            if alignment > 1:
+                # 对齐扫描：利用 struct 直接遍历对齐位置
+                # 计算区域起始的对齐偏移
+                align_offset = (alignment - (region_base % alignment)) % alignment
+                for offset in range(align_offset, len(data) - value_size + 1, alignment):
+                    if data[offset : offset + value_size] == search_bytes:
+                        state.scan_results.append(region_base + offset)
+                        if len(state.scan_results) >= max_results:
+                            break
+            else:
+                # 字符串/字节: 使用 bytes.find (C 实现，高效)
                 offset = 0
                 while offset <= len(data) - value_size:
                     pos = data.find(search_bytes, offset)
                     if pos == -1:
                         break
-                    state.scan_results.append(address + pos)
+                    state.scan_results.append(region_base + pos)
                     offset = pos + 1
                     if len(state.scan_results) >= max_results:
                         break
-            except Exception:
-                pass
-
-        address += region_size
+        except Exception:
+            pass
 
     count = len(state.scan_results)
     if count == 0:
@@ -634,14 +663,44 @@ def scan_memory_next(value: str, scan_type_override: str = "") -> str:
     except (ValueError, struct.error) as e:
         return f"错误: 无法编码值 '{value}' 为 {vtype} - {e}"
 
+    # 优化：将相邻地址分组，合并为批量读取以减少系统调用
     new_results = []
-    for addr in state.scan_results:
+    BATCH_THRESHOLD = 4096  # 地址间距小于此值时合并读取
+
+    i = 0
+    sorted_results = sorted(state.scan_results)
+
+    while i < len(sorted_results):
+        # 找到一组相邻地址
+        group_start = sorted_results[i]
+        group_end = sorted_results[i] + value_size
+        j = i + 1
+        while j < len(sorted_results):
+            if sorted_results[j] - group_start < BATCH_THRESHOLD:
+                group_end = sorted_results[j] + value_size
+                j += 1
+            else:
+                break
+
+        # 批量读取整个区域
+        read_size = group_end - group_start
         try:
-            data = state.pm.read_bytes(addr, value_size)
-            if data == search_bytes:
-                new_results.append(addr)
+            data = state.pm.read_bytes(group_start, read_size)
+            for k in range(i, j):
+                offset = sorted_results[k] - group_start
+                if data[offset : offset + value_size] == search_bytes:
+                    new_results.append(sorted_results[k])
         except Exception:
-            continue
+            # 回退到逐个读取
+            for k in range(i, j):
+                try:
+                    d = state.pm.read_bytes(sorted_results[k], value_size)
+                    if d == search_bytes:
+                        new_results.append(sorted_results[k])
+                except Exception:
+                    continue
+
+        i = j
 
     old_count = len(state.scan_results)
     state.scan_results = new_results
@@ -786,26 +845,34 @@ def scan_pattern(
     if not state.pm:
         return "错误: 未附加任何进程，请先使用 attach_process"
 
-    # 解析模式
+    # 解析模式，构建正则表达式（利用 re 的 C 实现加速匹配）
     parts = pattern.strip().split()
-    search_bytes = bytearray()
-    mask = []
+    regex_parts = []
+    has_wildcard = False
 
     for part in parts:
         if part in ("??", "?", "**"):
-            search_bytes.append(0)
-            mask.append(False)
+            regex_parts.append(b".")
+            has_wildcard = True
         else:
             try:
-                search_bytes.append(int(part, 16))
-                mask.append(True)
+                byte_val = int(part, 16)
+                # 转义正则特殊字符
+                regex_parts.append(re.escape(bytes([byte_val])))
             except ValueError:
                 return f"错误: 无效的模式字节 '{part}'"
 
-    pattern_len = len(search_bytes)
-    if pattern_len == 0:
+    if not regex_parts:
         return "错误: 模式为空"
 
+    # 构建正则
+    regex_pattern = b"".join(regex_parts)
+    try:
+        compiled = re.compile(regex_pattern, re.DOTALL)
+    except re.error as e:
+        return f"错误: 正则编译失败 - {e}"
+
+    pattern_len = len(parts)
     results = []
 
     if module_name:
@@ -820,16 +887,10 @@ def scan_pattern(
             size = module.SizeOfImage
             try:
                 data = state.pm.read_bytes(start, size)
-                for i in range(len(data) - pattern_len + 1):
-                    match = True
-                    for j in range(pattern_len):
-                        if mask[j] and data[i + j] != search_bytes[j]:
-                            match = False
-                            break
-                    if match:
-                        results.append(start + i)
-                        if len(results) >= 100:
-                            break
+                for m in compiled.finditer(data):
+                    results.append(start + m.start())
+                    if len(results) >= 100:
+                        break
             except Exception:
                 pass
         except Exception as e:
@@ -837,50 +898,18 @@ def scan_pattern(
     else:
         # 全内存搜索
         handle = state.pm.process_handle
-        address = 0x10000
-        end = 0x7FFFFFFFFFFF
 
-        class MEMORY_BASIC_INFORMATION(ctypes.Structure):
-            _fields_ = [
-                ("BaseAddress", ctypes.c_void_p),
-                ("AllocationBase", ctypes.c_void_p),
-                ("AllocationProtect", ctypes.wintypes.DWORD),
-                ("RegionSize", ctypes.c_size_t),
-                ("State", ctypes.wintypes.DWORD),
-                ("Protect", ctypes.wintypes.DWORD),
-                ("Type", ctypes.wintypes.DWORD),
-            ]
-
-        mbi = MEMORY_BASIC_INFORMATION()
-        mbi_size = ctypes.sizeof(mbi)
-
-        while address < end and len(results) < 100:
-            result = ctypes.windll.kernel32.VirtualQueryEx(
-                handle,
-                ctypes.c_void_p(address),
-                ctypes.byref(mbi),
-                mbi_size,
-            )
-            if result == 0:
+        for region_base, region_size in _iter_readable_regions(handle):
+            if len(results) >= 100:
                 break
-
-            if mbi.State == MEM_COMMIT and mbi.Protect in READABLE_PROTECTIONS:
-                try:
-                    data = state.pm.read_bytes(address, mbi.RegionSize)
-                    for i in range(len(data) - pattern_len + 1):
-                        match = True
-                        for j in range(pattern_len):
-                            if mask[j] and data[i + j] != search_bytes[j]:
-                                match = False
-                                break
-                        if match:
-                            results.append(address + i)
-                            if len(results) >= 100:
-                                break
-                except Exception:
-                    pass
-
-            address += mbi.RegionSize
+            try:
+                data = state.pm.read_bytes(region_base, region_size)
+                for m in compiled.finditer(data):
+                    results.append(region_base + m.start())
+                    if len(results) >= 100:
+                        break
+            except Exception:
+                pass
 
     if not results:
         return "特征码扫描完成，未找到匹配模式"
