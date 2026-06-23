@@ -1328,3 +1328,63 @@ def invalidate_window(process_name: str = "", process_id: int = 0) -> str:
         f"  找到窗口数: {len(hwnd_list)}\n"
         f"  成功重绘: {success}"
     )
+
+
+@mcp.tool()
+def encode_string(
+    text: str,
+    encoding: str = "utf-8",
+    null_terminate: bool = True,
+) -> str:
+    """字符串编码器 - 将文本编码为十六进制字符串
+
+    用于将字符串转换为可直接用于内存写入的十六进制格式。
+
+    Args:
+        text: 要编码的文本字符串
+        encoding: 编码格式 (utf-8/utf-16le/utf-16be/ascii/gbk/gb2312/latin1)
+        null_terminate: 是否在末尾添加 null 终止符（默认 True）
+
+    Returns:
+        十六进制字符串及相关信息
+    """
+    supported_encodings = [
+        "utf-8", "utf-16le", "utf-16be", "ascii",
+        "gbk", "gb2312", "latin1", "utf-32le", "utf-32be",
+    ]
+
+    if encoding.lower().replace("-", "") not in [
+        e.replace("-", "") for e in supported_encodings
+    ]:
+        return (
+            f"错误: 不支持的编码 '{encoding}'\n"
+            f"支持的编码: {', '.join(supported_encodings)}"
+        )
+
+    try:
+        encoded = text.encode(encoding)
+    except (UnicodeEncodeError, LookupError) as e:
+        return f"错误: 编码失败 - {e}"
+
+    if null_terminate:
+        # 根据编码添加对应宽度的 null 终止符
+        if encoding.lower() in ("utf-16le", "utf-16be"):
+            encoded += b"\x00\x00"
+        elif encoding.lower() in ("utf-32le", "utf-32be"):
+            encoded += b"\x00\x00\x00\x00"
+        else:
+            encoded += b"\x00"
+
+    hex_str = encoded.hex().upper()
+    hex_spaced = " ".join(f"{encoded[i]:02X}" for i in range(len(encoded)))
+
+    return (
+        f"编码结果:\n"
+        f"  原文: \"{text}\"\n"
+        f"  编码: {encoding}\n"
+        f"  字符数: {len(text)}\n"
+        f"  字节数: {len(encoded)}\n"
+        f"  Null终止: {'是' if null_terminate else '否'}\n\n"
+        f"  十六进制 (连续): {hex_str}\n"
+        f"  十六进制 (空格): {hex_spaced}"
+    )
