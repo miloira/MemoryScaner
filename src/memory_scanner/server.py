@@ -14,6 +14,7 @@ from enum import Enum
 import pymem
 import pymem.process
 import pymem.memory
+import pymem.pattern
 import psutil
 from mcp.server.fastmcp import FastMCP
 
@@ -845,19 +846,16 @@ def scan_pattern(
     if not state.pm:
         return "错误: 未附加任何进程，请先使用 attach_process"
 
-    # 解析模式，构建正则表达式（利用 re 的 C 实现加速匹配）
+    # 将用户友好的模式转换为 pymem 所需的 regex bytes pattern
     parts = pattern.strip().split()
     regex_parts = []
-    has_wildcard = False
 
     for part in parts:
         if part in ("??", "?", "**"):
             regex_parts.append(b".")
-            has_wildcard = True
         else:
             try:
                 byte_val = int(part, 16)
-                # 转义正则特殊字符
                 regex_parts.append(re.escape(bytes([byte_val])))
             except ValueError:
                 return f"错误: 无效的模式字节 '{part}'"
@@ -865,54 +863,36 @@ def scan_pattern(
     if not regex_parts:
         return "错误: 模式为空"
 
-    # 构建正则
     regex_pattern = b"".join(regex_parts)
+
     try:
-        compiled = re.compile(regex_pattern, re.DOTALL)
-    except re.error as e:
-        return f"错误: 正则编译失败 - {e}"
-
-    pattern_len = len(parts)
-    results = []
-
-    if module_name:
-        try:
+        if module_name:
             module = pymem.process.module_from_name(
                 state.pm.process_handle, module_name
             )
             if not module:
                 return f"错误: 未找到模块 '{module_name}'"
 
-            start = module.lpBaseOfDll
-            size = module.SizeOfImage
-            try:
-                data = state.pm.read_bytes(start, size)
-                for m in compiled.finditer(data):
-                    results.append(start + m.start())
-                    if len(results) >= 100:
-                        break
-            except Exception:
-                pass
-        except Exception as e:
-            return f"错误: 模块搜索失败 - {e}"
-    else:
-        # 全内存搜索
-        handle = state.pm.process_handle
-
-        for region_base, region_size in _iter_readable_regions(handle):
-            if len(results) >= 100:
-                break
-            try:
-                data = state.pm.read_bytes(region_base, region_size)
-                for m in compiled.finditer(data):
-                    results.append(region_base + m.start())
-                    if len(results) >= 100:
-                        break
-            except Exception:
-                pass
+            results = pymem.pattern.pattern_scan_module(
+                state.pm.process_handle,
+                module,
+                regex_pattern,
+                return_multiple=True,
+            )
+        else:
+            results = pymem.pattern.pattern_scan_all(
+                state.pm.process_handle,
+                regex_pattern,
+                return_multiple=True,
+            )
+    except Exception as e:
+        return f"错误: 扫描失败 - {e}"
 
     if not results:
         return "特征码扫描完成，未找到匹配模式"
+
+    # 限制结果数量
+    results = results[:100]
 
     preview = [f"  0x{addr:X}" for addr in results[:20]]
     result_text = "\n".join(preview)
